@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Playable Ad — Three.js FBX</title>
+  <style>
+    html,body { height:100%; margin:0; background:#000; -webkit-tap-highlight-color: transparent; }
+    #container { position:relative; width:100%; height:100vh; overflow:hidden; touch-action: none; background:#0b0b0b; display:flex; align-items:center; justify-content:center; }
+    canvas { display:block; width:100%; height:100%; }
+    /* CTA */
+    .cta {
+      position:absolute;
+      right:18px;
+      bottom:22px;
+      background:linear-gradient(90deg,#ff7a18,#ff3d6b);
+      color:white;
+      font-weight:700;
+      padding:12px 18px;
+      border-radius:28px;
+      box-shadow:0 6px 18px rgba(0,0,0,0.45);
+      font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      z-index:30;
+      user-select:none;
+      -webkit-user-select:none;
+      cursor:pointer;
+      text-decoration:none;
+    }
+    .skip {
+      position:absolute;
+      left:12px; top:12px;
+      color:#fff; font-size:13px; opacity:.9;
+      backdrop-filter: blur(4px);
+      padding:8px 10px; border-radius:8px; z-index:30;
+      background: rgba(0,0,0,0.25);
+      cursor:pointer;
+    }
+    /* Loading poster (fallback while 3D loads) */
+    #poster {
+      position:absolute; inset:0; z-index:5; background-size:cover; background-position:center;
+      display:flex; align-items:center; justify-content:center;
+    }
+    #loading {
+      color:white; font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      font-size:14px; padding:12px; background:rgba(0,0,0,0.5); border-radius:8px;
+    }
+    .muted {
+      position:absolute; left:50%; transform:translateX(-50%); bottom:90px; color:#ddd; font-size:12px; z-index:30;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <div id="poster" style="background-image: url('assets/poster.jpg');">
+      <div id="loading">Loading…</div>
+    </div>
+
+    <a id="cta" class="cta" href="#" role="button">INSTALL</a>
+    <div id="skip" class="skip" role="button">Skip</div>
+    <div id="hint" class="muted">Tap model to play • Drag to rotate</div>
+  </div>
+
+  <!-- Three.js (module build) and FBXLoader from CDN -->
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+    import { FBXLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/FBXLoader.js';
+    import { RGBELoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/RGBELoader.js';
+
+    // --------- CONFIG ----------
+    const MODEL_URL = 'assets/model.fbx';         // <-- replace with your FBX file
+    const POSTER_ID = 'poster';
+    const CTA_LINK = '#';                         // <-- replace with your install / landing URL
+    const CTA_TEXT = 'INSTALL';                   // Customize CTA text
+    const MAX_DPR = 1.5;                          // clamp devicePixelRatio for mobile perf
+    const AUTO_PLAY_ANIMATION = false;            // set true to autoplay model animation on load
+    // ---------------------------
+
+    // Basic DOM
+    const container = document.getElementById('container');
+    const poster = document.getElementById(POSTER_ID);
+    const loadingEl = document.getElementById('loading');
+    const cta = document.getElementById('cta');
+    const skip = document.getElementById('skip');
+    const hint = document.getElementById('hint');
+
+    cta.href = CTA_LINK;
+    cta.textContent = CTA_TEXT;
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_DPR));
+    renderer.setSize(container.clientWidth, container.clientHeight, false);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.shadowMap.enabled = false; // keep shadows off for ad performance
+    container.appendChild(renderer.domElement);
+
+    // Scene & camera
+    const scene = new THREE.Scene();
+    scene.background = null; // transparent background so poster is visible until model ready
+
+    const camera = new THREE.PerspectiveCamera(38, container.clientWidth / container.clientHeight, 0.1, 1000);
+    camera.position.set(0, 1.2, 2.6);
+
+    // Lights (simple and cheap)
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.9);
+    scene.add(hemi);
+
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(2, 4, 2);
+    scene.add(dir);
+
+    // Ground plane (subtle)
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(10, 10),
+      new THREE.MeshStandardMaterial({ color: 0x080808, metalness: 0.0, roughness: 1.0 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.02;
+    ground.receiveShadow = false;
+    scene.add(ground);
+
+    // Resize handling
+    function onResize(){
+      const w = container.clientWidth, h = container.clientHeight;
+      camera.aspect = w/h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w,h,false);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_DPR));
+    }
+    window.addEventListener('resize', onResize, { passive: true });
+
+    // Model loading
+    let mixer = null;
+    let modelRoot = new THREE.Group();
+    scene.add(modelRoot);
+
+    const fbxLoader = new FBXLoader();
+
+    // Helpful: provide small timeout to ensure poster visible for a tiny bit for UX
+    let loaded = false;
+    function hidePoster() {
+      if (loaded) return;
+      poster.style.transition = 'opacity 280ms ease';
+      poster.style.opacity = '0';
+      setTimeout(()=> poster.style.display = 'none', 300);
+      loaded = true;
+    }
+
+    function applyMobileOptimizations(object){
+      // reduce material quality where possible (cheap trick)
+      object.traverse((c) => {
+        if (c.isMesh) {
+          // prefer a simple material if original has many maps (fallback)
+          if (!c.material) return;
+          // if the material is an array, replace with a single basic material to save fillrate
+          // But keep the object's color to preserve appearance.
+          if (Array.isArray(c.material) && c.material.length > 1) {
+            c.material = new THREE.MeshStandardMaterial({ color: c.material[0].color || 0x999999 });
+          }
+          // Lower LOD: disable shadow casting on mobile
+          c.castShadow = false;
+          c.receiveShadow = false;
+        }
+      });
+    }
+
+    loadingEl.textContent = 'Loading model...';
+    fbxLoader.load(MODEL_URL,
+      (fbx) => {
+        // If the FBX is huge, scale down
+        fbx.scale.setScalar(0.01); // adjust based on your model's unit
+        // center model (compute bbox)
+        const bbox = new THREE.Box3().setFromObject(fbx);
+        const center = bbox.getCenter(new THREE.Vector3());
+        fbx.position.sub(center); // center origin
+
+        applyMobileOptimizations(fbx);
+
+        modelRoot.add(fbx);
+
+        // Setup animations if any
+        if (fbx.animations && fbx.animations.length) {
+          mixer = new THREE.AnimationMixer(fbx);
+          const action = mixer.clipAction(fbx.animations[0]);
+          action.clampWhenFinished = true;
+          action.loop = THREE.LoopOnce;
+          if (AUTO_PLAY_ANIMATION) action.play();
+        }
+
+        // Slight camera framing based on bbox size
+        const size = bbox.getSize(new THREE.Vector3()).length();
+        const idealDist = Math.max(1.6, size * 1.2);
+        camera.position.set(0, Math.max(1.0, size*0.6), idealDist);
+
+        hidePoster();
+        loadingEl.textContent = '';
+        hint.style.opacity = '1';
+      },
+      (xhr) => {
+        // progress - xhr.loaded / xhr.total
+        if (xhr.total) {
+          const pct = Math.round((xhr.loaded / xhr.total) * 100);
+          loadingEl.textContent = `Loading model… ${pct}%`;
+        }
+      },
+      (err) => {
+        console.error('FBX load error', err);
+        loadingEl.textContent = 'Failed to load 3D — showing poster';
+        // keep poster visible and fallback to a static CTA
+      }
+    );
+
+    // Simple animation loop
+    const clock = new THREE.Clock();
+    function animate() {
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      if (mixer) mixer.update(dt);
+
+      // subtle auto-rotation when idle
+      if (!isUserInteracting) {
+        modelRoot.rotation.y += 0.003;
+      }
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ---------- Interaction: drag-to-rotate, tap-to-play ----------
+    let isUserInteracting = false;
+    let lastX = 0;
+    let lastY = 0;
+    let velocity = 0;
+
+    function onPointerDown(e) {
+      isUserInteracting = true;
+      lastX = e.clientX || e.touches && e.touches[0].clientX;
+      lastY = e.clientY || e.touches && e.touches[0].clientY;
+      velocity = 0;
+      hint.style.opacity = '0.8';
+    }
+    function onPointerMove(e) {
+      if (!isUserInteracting) return;
+      const clientX = e.clientX || e.touches && e.touches[0].clientX;
+      const dx = clientX - lastX;
+      lastX = clientX;
+      // rotate modelRoot around Y
+      modelRoot.rotation.y += dx * 0.006;
+      velocity = dx;
+    }
+    function onPointerUp(e) {
+      isUserInteracting = false;
+      // small fling
+      if (Math.abs(velocity) > 8) {
+        // apply quick spin
+        const sign = velocity > 0 ? 1 : -1;
+        let spin = 0.2 * sign;
+        const spinInterval = setInterval(() => {
+          modelRoot.rotation.y += spin;
+          spin *= 0.88;
+          if (Math.abs(spin) < 0.001) clearInterval(spinInterval);
+        }, 16);
+      }
+    }
+
+    // Tap detection to play animation
+    let touchStartTime = 0;
+    let touchStartPos = null;
+    function onTapStart(e) {
+      touchStartTime = performance.now();
+      touchStartPos = [e.clientX || e.touches && e.touches[0].clientX, e.clientY || e.touches && e.touches[0].clientY];
+      onPointerDown(e);
+    }
+    function onTapEnd(e) {
+      onPointerUp(e);
+      const duration = performance.now() - touchStartTime;
+      const endPos = [e.clientX || (e.changedTouches && e.changedTouches[0].clientX), e.clientY || (e.changedTouches && e.changedTouches[0].clientY)];
+      const dist = Math.hypot(endPos[0] - (touchStartPos && touchStartPos[0] || 0), endPos[1] - (touchStartPos && touchStartPos[1] || 0));
+      // treated as tap if short and small movement
+      if (duration < 300 && dist < 10) {
+        // play animation if present
+        if (mixer) {
+          const actions = mixer._actions || []; // internal access but ok for ads
+          if (actions.length) {
+            const a = actions[0];
+            a.reset();
+            a.play();
+            // optional: when animation ends, show CTA highlight
+            a.getMixer().addEventListener('finished', () => {
+              flashCTA();
+            });
+          } else {
+            flashCTA();
+          }
+        } else {
+          // no animation, flash CTA
+          flashCTA();
+        }
+      }
+    }
+
+    function flashCTA(){
+      cta.animate && cta.animate([{ transform:'scale(1)' },{ transform:'scale(1.08)' }, { transform:'scale(1)' }], { duration:360, easing:'ease-out' });
+    }
+
+    // Pointer event wiring (support both mouse and touch)
+    renderer.domElement.addEventListener('pointerdown', onTapStart, { passive:true });
+    renderer.domElement.addEventListener('pointermove', (e)=>{ onPointerMove(e); }, { passive:true });
+    renderer.domElement.addEventListener('pointerup', onTapEnd, { passive:true });
+    renderer.domElement.addEventListener('pointercancel', onTapEnd, { passive:true });
+    renderer.domElement.addEventListener('pointerleave', onPointerUp, { passive:true });
+
+    // CTA handling
+    cta.addEventListener('click', (ev) => {
+      // ad networks usually intercept click; if not, open landing
+      // Use window.open to ensure opening on user gesture
+      ev.preventDefault();
+      try { window.open(CTA_LINK, '_blank'); }
+      catch(e){ location.href = CTA_LINK; }
+    });
+
+    // Skip button: can be used to close ad or go to CTA
+    skip.addEventListener('click', ()=> {
+      // send the user to CTA or close overlay depending on platform
+      try { window.open(CTA_LINK, '_blank'); }
+      catch(e){ location.href = CTA_LINK; }
+    });
+
+    // Accessibility: tap poster to open CTA when model fails to load
+    poster.addEventListener('click', ()=>{ window.open(CTA_LINK, '_blank'); });
+
+    // Prevent overscroll on mobile
+    document.body.addEventListener('touchmove', (e) => { e.preventDefault(); }, { passive:false });
+
+    // Friendly hint fade after a while
+    setTimeout(()=> hint.style.opacity='0.6', 3500);
+
+  </script>
+</body>
+</html>
